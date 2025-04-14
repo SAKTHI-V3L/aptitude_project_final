@@ -129,10 +129,12 @@ def start_test():
     return redirect(url_for('question'))
 
 @app.route('/question', methods=['GET'])
+
 def question():
     index = session.get('index', 0)
     questions = session.get('questions', [])
-    if index >= len(questions):
+    total_questions = len(questions)
+    if index >= total_questions:
         return redirect(url_for('results'))
     
     # Set phase: Calibration for first 15 questions, Adaptive thereafter
@@ -155,7 +157,15 @@ def question():
         'q': qgen['question'],
         'options': qgen['options']
     }
-    return render_template('question.html', question=question_data, phase=session['phase'])
+    # Pass current question number and total questions
+    return render_template(
+        'question.html',
+        question=question_data,
+        phase=session['phase'],
+        current_question_number=index+1,
+        total_questions=total_questions
+    )
+
 
 @app.route('/submit_answer', methods=['POST'])
 
@@ -176,7 +186,7 @@ def submit_answer():
     
     # Defensive check: ensure both selected_option and correct_answer are strings before comparing
     if selected_option is not None and correct_answer is not None:
-        if selected_option.strip() == correct_answer.strip():
+        if selected_option.strip() == str(correct_answer).strip():
             outcome = 1
         else:
             outcome = 0
