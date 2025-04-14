@@ -13,8 +13,8 @@ app.secret_key = 'supersecretkey'
 # -------------------------------
 # CSV Loading and Setup
 # -------------------------------
-# Adjust the file path if needed
-df = pd.read_excel(r"C:\Users\svelo\OneDrive\Desktop\aptitude_project\aptitude_question_difficulty_refined.xlsx")
+# Make sure the Excel file is in the project folder or update the path below.
+df = pd.read_excel("aptitude_question_difficulty_refined.xlsx")
 categories = df['category'].unique().tolist()
 
 # -------------------------------
@@ -37,16 +37,15 @@ class Question:
         self.category = category
         self.difficulty = difficulty
 
+# Now, the User class stores ratings per category
 class User:
-    def __init__(self):
-        self.rating = 800.0
-        self.score = 0.0
-        self.attempts = []  # List of tuples: (question_id, outcome, question_difficulty)
+    def __init__(self, selected_categories=[]):
+        # Initialize rating for each selected category to 800.0
+        self.ratings = {cat: 800.0 for cat in selected_categories}
+        self.attempts = []  # List of tuples: (question_id, outcome, difficulty)
 
     def record_attempt(self, question_id, outcome, question_difficulty):
         self.attempts.append((question_id, outcome, question_difficulty))
-        if outcome == 1:
-            self.score += question_difficulty
 
 # -------------------------------
 # LLM-based Question Generation
@@ -91,7 +90,7 @@ def generate_similar_question(given_question, given_answer, given_explanation, m
                 return data
         except Exception as e:
             continue
-    # Fallback if API generation fails
+    # Fallback if generation fails
     return {
         "question": given_question,
         "options": ["Option A", "Option B", "Option C", "Option D"],
@@ -112,7 +111,7 @@ def start_test():
     if len(selected) != 3:
         return "Please select exactly 3 categories."
     
-    # Filter questions based on selected categories and sample up to 50 questions
+    # Filter questions from the selected categories
     pool = df[df['category'].isin(selected)]
     qbank = [
         Question(row['s.no'], row['questions'], row['options'], row['answer'],
@@ -121,15 +120,19 @@ def start_test():
     ]
     sample_count = min(50, len(qbank))
     questions = random.sample(qbank, sample_count)
-    # Save question bank and user data in the session (convert objects to dict)
+    
+    # Save questions in the session (convert objects to dict)
     session['questions'] = [q.__dict__ for q in questions]
-    session['user'] = User().__dict__
+    # Create User with a rating per selected category
+    user = User(selected)
+    session['user'] = user.__dict__
     session['index'] = 0
     session['phase'] = 'Calibration'
+    # Reset any previous chatbot answer
+    session['chat_response'] = ''
     return redirect(url_for('question'))
 
 @app.route('/question', methods=['GET'])
-
 def question():
     index = session.get('index', 0)
     questions = session.get('questions', [])
@@ -137,19 +140,16 @@ def question():
     if index >= total_questions:
         return redirect(url_for('results'))
     
-    # Set phase: Calibration for first 15 questions, Adaptive thereafter
-    if index < 15:
-        session['phase'] = 'Calibration'
-    else:
-        session['phase'] = 'Adaptive'
+    # Determine phase: Calibration for first 15 questions, Adaptive thereafter
+    session['phase'] = 'Calibration' if index < 15 else 'Adaptive'
     
-    # Get the current question from the session and generate a similar variant
+    # Get current question and generate a variant via LLM
     current_q = questions[index]
     qgen = generate_similar_question(current_q['question'], current_q['answer'], current_q['explanation'])
     # Update current question text and options in session
     session['questions'][index]['question'] = qgen['question']
     session['questions'][index]['options'] = qgen['options']
-    # Store the correct answer and explanation for feedback
+    # Save correct answer and explanation in session (for feedback)
     session['current_correct'] = qgen['answer']
     session['current_explanation'] = qgen['explanation']
     
@@ -157,78 +157,112 @@ def question():
         'q': qgen['question'],
         'options': qgen['options']
     }
-    # Pass current question number and total questions
-    return render_template(
-        'question.html',
-        question=question_data,
-        phase=session['phase'],
-        current_question_number=index+1,
-        total_questions=total_questions
-    )
-
+    return render_template('question.html',
+                           question=question_data,
+                           phase=session['phase'],
+                           current_question_number=index+1,
+                           total_questions=total_questions)
 
 @app.route('/submit_answer', methods=['POST'])
-
 def submit_answer():
     selected_option = request.form.get('option')
     index = session.get('index', 0)
     questions = session.get('questions', [])
     current_q = questions[index]
     
-    # Prepare user object from session
+    # Prepare user object from session and update as a User instance
     user_data = session.get('user')
     user = User()
     user.__dict__.update(user_data)
     
-    # Retrieve correct answer and explanation from session
+    # Get correct answer and explanation from session with defensive defaults
     correct_answer = session.get('current_correct', '')
     explanation = session.get('current_explanation', '')
     
-    # Defensive check: ensure both selected_option and correct_answer are strings before comparing
+    # Determine outcome (1 if correct, 0 otherwise)
     if selected_option is not None and correct_answer is not None:
-        if selected_option.strip() == str(correct_answer).strip():
-            outcome = 1
-        else:
-            outcome = 0
+        outcome = 1 if selected_option.strip() == correct_answer.strip() else 0
     else:
         outcome = 0
 
-    # Calculate rating adjustment
-    expected = 1.0 / (1 + 10 ** ((current_q['difficulty'] - user.rating) / 400))
-    old_rating = user.rating
-    user.rating += 20 * (outcome - expected)
+    # Update rating for the category of the question
+    category = current_q.get('category')
+    current_rating = user.ratings.get(category, 800.0)
+    expected = 1.0 / (1 + 10 ** ((current_q['difficulty'] - current_rating) / 400))
+    old_rating = current_rating
+    new_rating = current_rating + 20 * (outcome - expected)
+    user.ratings[category] = new_rating
+
+    # Record the attempt for analytics if desired
     user.record_attempt(current_q['id'], outcome, current_q['difficulty'])
     
-    # Save updated user info and increment the question index
+    # Save updated user and increment question index
     session['user'] = user.__dict__
     session['index'] = index + 1
     
-    # Store the feedback details in session for display on the feedback page
+    # Store feedback details to show on the feedback page
     session['feedback'] = {
         'selected_option': selected_option,
         'correct_answer': correct_answer,
         'explanation': explanation,
         'outcome': outcome,
         'old_rating': round(old_rating, 2),
-        'new_rating': round(user.rating, 2)
+        'new_rating': round(new_rating, 2),
+        'category': category
     }
+    # Clear previous chatbot response (if any)
+    session['chat_response'] = ''
     return redirect(url_for('feedback'))
 
 @app.route('/feedback', methods=['GET'])
 def feedback():
     feedback = session.get('feedback', {})
-    # Determine if there are more questions left
     index = session.get('index', 0)
     total = len(session.get('questions', []))
     next_available = index < total
-    return render_template('feedback.html', feedback=feedback, next_available=next_available)
+    chat_response = session.get('chat_response', '')
+    return render_template('feedback.html', feedback=feedback, next_available=next_available, chat_response=chat_response)
+
+# New route: Chatbot Q/A after feedback
+@app.route('/chat', methods=['POST'])
+def chat():
+    user_query = request.form.get('query')
+    # Retrieve the question that was just answered (index-1)
+    index = session.get('index', 0)
+    if index > 0:
+        q_record = session['questions'][index - 1]
+    else:
+        q_record = {}
+    # Prepare a prompt to the LLM answer solver that includes question details and the user query.
+    chat_prompt = PromptTemplate.from_template(
+        """
+        ### QUESTION: {question}
+        ### OPTIONS: {options}
+        ### ANSWER: {answer}
+        ### EXPLANATION: {explanation}
+        ### USER QUERY: {query}
+        Provide a helpful and concise answer.
+        """
+    )
+    chain = chat_prompt | llm_answer_solver
+    response = chain.invoke({
+        "question": q_record.get('question', ''),
+        "options": q_record.get('options', []),
+        "answer": q_record.get('answer', ''),
+        "explanation": q_record.get('explanation', ''),
+        "query": user_query
+    }).content
+    # Store the chat response in session to display on the feedback page.
+    session['chat_response'] = response
+    return redirect(url_for('feedback'))
 
 @app.route('/results', methods=['GET'])
 def results():
     user_data = session.get('user')
     user = User()
     user.__dict__.update(user_data)
-    return render_template('results.html', rating=round(user.rating, 2), score=round(user.score, 2))
+    ratings = user.ratings
+    return render_template('results.html', ratings=ratings)
 
 # -------------------------------
 # Run the Flask App
